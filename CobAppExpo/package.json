@@ -9,6 +9,8 @@
     "web": "expo start --web"
   },
   "dependencies": {
+    "@react-native-community/slider": "5.0.1",
+    "@react-native/gradle-plugin": "0.81.5",
     "expo": "~54.0.33",
     "expo-camera": "~17.0.10",
     "expo-face-detector": "^13.0.2",

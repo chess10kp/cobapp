@@ -7,8 +7,9 @@ import {
   Text,
   View,
 } from 'react-native';
+import Slider from '@react-native-community/slider';
 import {CameraView, useCameraPermissions, useMicrophonePermissions} from 'expo-camera';
-import {useFaceDetection} from '../hooks/useFaceDetection';
+import {useFaceDetection, FrameDetectionResult} from '../hooks/useFaceDetection';
 import {FaceBox} from '../components/FaceBox';
 import * as VideoThumbnails from 'expo-video-thumbnails';
 
@@ -21,34 +22,60 @@ export function FaceDetectionScreen() {
     width: number;
     height: number;
   } | null>(null);
+  const [videoDuration, setVideoDuration] = useState(0);
   const [facing, setFacing] = useState<'front' | 'back'>('back');
   const [isRecording, setIsRecording] = useState(false);
   const [recordingTime, setRecordingTime] = useState(0);
+  const [currentFrameIndex, setCurrentFrameIndex] = useState(0);
+  const [isAutoPlaying, setIsAutoPlaying] = useState(false);
+  const [isUserScrubbing, setIsUserScrubbing] = useState(false);
+  const [wrapperLayout, setWrapperLayout] = useState({width: 0, height: 0});
   const cameraRef = useRef<CameraView>(null);
   const recordingTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const animationTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  const computeImageDisplayRect = useCallback(
+    (imgW: number, imgH: number, viewW: number, viewH: number) => {
+      if (viewW === 0 || viewH === 0 || imgW === 0 || imgH === 0) {
+        return {displayWidth: 0, displayHeight: 0, offsetX: 0, offsetY: 0};
+      }
+      const scale = Math.min(viewW / imgW, viewH / imgH);
+      const displayWidth = imgW * scale;
+      const displayHeight = imgH * scale;
+      return {
+        displayWidth,
+        displayHeight,
+        offsetX: (viewW - displayWidth) / 2,
+        offsetY: (viewH - displayHeight) / 2,
+      };
+    },
+    [],
+  );
 
   const [permission, requestPermission] = useCameraPermissions();
   const [micPermission, requestMicPermission] = useMicrophonePermissions();
-  const {faces, isProcessing, error, detectFaces} = useFaceDetection();
+  const {
+    faces,
+    isProcessing,
+    error,
+    detectFaces,
+    detectFacesInVideo,
+    frameResults,
+    isProcessingVideo,
+    videoProgress,
+  } = useFaceDetection();
 
   const handleVideoRecorded = useCallback(
     async (videoUri: string) => {
-      try {
-        const {uri, width, height} = await VideoThumbnails.getThumbnailAsync(
-          videoUri,
-          {time: 0},
-        );
-        setCapturedPhoto({uri, width, height});
-        await detectFaces(uri);
-        setScreenState('result');
-      } catch (err) {
-        console.error('Failed to extract video thumbnail:', err);
-        setCapturedPhoto({uri: videoUri, width: 0, height: 0});
-        await detectFaces(videoUri);
-        setScreenState('result');
-      }
+      const maxDuration = 15000;
+      setVideoDuration(maxDuration);
+      setCapturedPhoto({uri: videoUri, width: 0, height: 0});
+      setScreenState('result');
+      setCurrentFrameIndex(0);
+      setIsAutoPlaying(false);
+      await detectFacesInVideo(videoUri, maxDuration);
     },
-    [detectFaces],
+    [detectFacesInVideo],
   );
 
   const clearRecordingTimer = useCallback(() => {
@@ -62,6 +89,30 @@ export function FaceDetectionScreen() {
   useEffect(() => {
     return () => clearRecordingTimer();
   }, [clearRecordingTimer]);
+
+  useEffect(() => {
+    if (animationTimerRef.current) {
+      clearInterval(animationTimerRef.current);
+      animationTimerRef.current = null;
+    }
+    if (isAutoPlaying && frameResults.length > 0) {
+      animationTimerRef.current = setInterval(() => {
+        setCurrentFrameIndex(prev => {
+          const next = prev + 1;
+          if (next >= frameResults.length) {
+            return 0;
+          }
+          return next;
+        });
+      }, 500);
+    }
+    return () => {
+      if (animationTimerRef.current) {
+        clearInterval(animationTimerRef.current);
+        animationTimerRef.current = null;
+      }
+    };
+  }, [isAutoPlaying, frameResults.length]);
 
   const handleCapture = useCallback(async () => {
     if (!cameraRef.current || isRecording) {
@@ -120,6 +171,32 @@ export function FaceDetectionScreen() {
   const handleRetake = useCallback(() => {
     setCapturedPhoto(null);
     setScreenState('camera');
+    setCurrentFrameIndex(0);
+    setIsAutoPlaying(false);
+    if (animationTimerRef.current) {
+      clearInterval(animationTimerRef.current);
+      animationTimerRef.current = null;
+    }
+  }, []);
+
+  const getCurrentFrame = useCallback((): FrameDetectionResult | null => {
+    if (frameResults.length === 0) return null;
+    const idx = Math.min(currentFrameIndex, frameResults.length - 1);
+    return frameResults[idx];
+  }, [frameResults, currentFrameIndex]);
+
+  const handleScrubComplete = useCallback(
+    async (value: number) => {
+      setIsUserScrubbing(false);
+      if (frameResults.length === 0) return;
+      const targetIndex = Math.round(value * (frameResults.length - 1));
+      setCurrentFrameIndex(targetIndex);
+    },
+    [frameResults],
+  );
+
+  const toggleAutoPlay = useCallback(() => {
+    setIsAutoPlaying(prev => !prev);
   }, []);
 
   if (!permission) {
@@ -147,35 +224,131 @@ export function FaceDetectionScreen() {
   }
 
   if (screenState === 'result' && capturedPhoto) {
+    const currentFrame = getCurrentFrame();
+    const totalFrames = frameResults.length;
+    const facesDetectedCount = frameResults.filter(f => f.faces.length > 0).length;
+    const faceDetectionRate =
+      totalFrames > 0 ? Math.round((facesDetectedCount / totalFrames) * 100) : 0;
+
+    if (isProcessingVideo) {
+      const progressPercent = Math.round(videoProgress * 100);
+      return (
+        <View style={styles.container}>
+          <View style={styles.analyzingContainer}>
+            <ActivityIndicator size="large" color="#00FF00" />
+            <Text style={styles.analyzingText}>Analyzing video...</Text>
+            <View style={styles.progressBarContainer}>
+              <View
+                style={[
+                  styles.progressBar,
+                  {width: (progressPercent + '%') as import('react-native').DimensionValue},
+                ]}
+              />
+            </View>
+            <Text style={styles.progressText}>{progressPercent}%</Text>
+          </View>
+        </View>
+      );
+    }
+
+    if (!currentFrame && frameResults.length === 0) {
+      return (
+        <View style={styles.container}>
+          <View style={styles.centered}>
+            <Text style={styles.text}>No frames analyzed</Text>
+            <Pressable style={styles.retakeButton} onPress={handleRetake}>
+              <Text style={styles.retakeButtonText}>Retake</Text>
+            </Pressable>
+          </View>
+        </View>
+      );
+    }
+
+    const sliderValue = totalFrames > 1 ? currentFrameIndex / (totalFrames - 1) : 0;
+
+    const currentThumb = currentFrame
+      ? {w: currentFrame.thumbnailWidth, h: currentFrame.thumbnailHeight}
+      : {w: capturedPhoto.width || 400, h: capturedPhoto.height || 400};
+    const displayRect = computeImageDisplayRect(
+      currentThumb.w,
+      currentThumb.h,
+      wrapperLayout.width,
+      wrapperLayout.height,
+    );
+
     return (
       <View style={styles.container}>
         <View style={styles.resultContainer}>
-          <View style={styles.imageWrapper}>
+          <View
+            style={styles.imageWrapper}
+            onLayout={e =>
+              setWrapperLayout({
+                width: e.nativeEvent.layout.width,
+                height: e.nativeEvent.layout.height,
+              })
+            }>
             <Image
-              source={{uri: capturedPhoto.uri}}
+              source={{uri: currentFrame?.thumbnailUri || capturedPhoto.uri}}
               style={styles.capturedImage}
               resizeMode="contain"
             />
-            {faces.map((face, index) => (
+            {currentFrame?.faces.map((face, index) => (
               <FaceBox
                 key={index}
                 bounds={face.bounds}
-                imageWidth={capturedPhoto.width}
-                imageHeight={capturedPhoto.height}
-                viewWidth={capturedPhoto.width}
-                viewHeight={capturedPhoto.height}
+                imageWidth={currentThumb.w}
+                imageHeight={currentThumb.h}
+                viewWidth={displayRect.displayWidth || currentThumb.w}
+                viewHeight={displayRect.displayHeight || currentThumb.h}
+                offsetX={displayRect.offsetX}
+                offsetY={displayRect.offsetY}
               />
             ))}
           </View>
           <View style={styles.resultOverlay}>
-            <Text style={styles.resultText}>
-              {faces.length === 0
-                ? 'No faces detected'
-                : `${faces.length} face${faces.length > 1 ? 's' : ''} detected`}
-            </Text>
-            <Pressable style={styles.retakeButton} onPress={handleRetake}>
-              <Text style={styles.retakeButtonText}>Retake</Text>
-            </Pressable>
+            <View style={styles.statsRow}>
+              <Text style={styles.resultText}>
+                {currentFrame
+                  ? 't=' + (currentFrame.timestamp / 1000).toFixed(1) + 's'
+                  : 'No data'}
+              </Text>
+              <Text style={styles.resultText}>
+                {currentFrameIndex + 1} / {totalFrames}
+              </Text>
+            </View>
+            <View style={styles.sliderContainer}>
+              <Slider
+                style={styles.slider}
+                minimumValue={0}
+                maximumValue={1}
+                value={sliderValue}
+                onSlidingStart={() => setIsUserScrubbing(true)}
+                onValueChange={val => {
+                  if (frameResults.length > 1) {
+                    setCurrentFrameIndex(Math.round(val * (frameResults.length - 1)));
+                  }
+                }}
+                onSlidingComplete={handleScrubComplete}
+                minimumTrackTintColor="#00FF00"
+                maximumTrackTintColor="rgba(255,255,255,0.3)"
+                thumbTintColor="#00FF00"
+              />
+            </View>
+            <View style={styles.controlsRow}>
+              <Pressable style={styles.playButton} onPress={toggleAutoPlay}>
+                <Text style={styles.playButtonText}>
+                  {isAutoPlaying ? '⏸' : '▶'}
+                </Text>
+              </Pressable>
+              <View style={styles.statsBadge}>
+                <Text style={styles.statsText}>
+                  Face: {faceDetectionRate}% | {facesDetectedCount}/{totalFrames} frames
+                </Text>
+              </View>
+              <Pressable style={styles.retakeButton} onPress={handleRetake}>
+                <Text style={styles.retakeButtonText}>Retake</Text>
+              </Pressable>
+            </View>
           </View>
         </View>
       </View>
@@ -354,10 +527,8 @@ const styles = StyleSheet.create({
     right: 0,
     padding: 20,
     paddingBottom: 40,
-    backgroundColor: 'rgba(0,0,0,0.6)',
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
+    backgroundColor: 'rgba(0,0,0,0.8)',
+    alignItems: 'stretch',
   },
   resultText: {
     color: '#FFFFFF',
@@ -366,14 +537,84 @@ const styles = StyleSheet.create({
   },
   retakeButton: {
     backgroundColor: '#00FF00',
-    paddingHorizontal: 24,
-    paddingVertical: 12,
+    paddingHorizontal: 20,
+    paddingVertical: 10,
     borderRadius: 8,
   },
   retakeButtonText: {
     color: '#000',
-    fontSize: 16,
+    fontSize: 14,
     fontWeight: '600',
+  },
+  analyzingContainer: {
+    flex: 1,
+    justifyContent: 'center',
+    alignItems: 'center',
+    gap: 16,
+  },
+  analyzingText: {
+    color: '#FFFFFF',
+    fontSize: 20,
+    fontWeight: '600',
+  },
+  progressBarContainer: {
+    width: '80%',
+    height: 8,
+    backgroundColor: 'rgba(255,255,255,0.2)',
+    borderRadius: 4,
+    overflow: 'hidden',
+  },
+  progressBar: {
+    height: '100%',
+    backgroundColor: '#00FF00',
+    borderRadius: 4,
+  },
+  progressText: {
+    color: '#FFFFFF',
+    fontSize: 16,
+  },
+  statsRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    marginBottom: 12,
+  },
+  sliderContainer: {
+    marginBottom: 12,
+  },
+  slider: {
+    width: '100%',
+    height: 40,
+  },
+  controlsRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    gap: 12,
+  },
+  playButton: {
+    width: 48,
+    height: 48,
+    borderRadius: 24,
+    backgroundColor: '#00FF00',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  playButtonText: {
+    fontSize: 20,
+    color: '#000',
+  },
+  statsBadge: {
+    flex: 1,
+    backgroundColor: 'rgba(255,255,255,0.1)',
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    borderRadius: 8,
+    alignItems: 'center',
+  },
+  statsText: {
+    color: '#FFFFFF',
+    fontSize: 12,
+    fontWeight: '500',
   },
   errorOverlay: {
     position: 'absolute',

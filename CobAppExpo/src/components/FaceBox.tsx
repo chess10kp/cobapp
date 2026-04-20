@@ -8,6 +8,8 @@ interface FaceBoxProps {
   imageHeight: number;
   viewWidth: number;
   viewHeight: number;
+  offsetX?: number;
+  offsetY?: number;
 }
 
 export function FaceBox({
@@ -16,12 +18,14 @@ export function FaceBox({
   imageHeight,
   viewWidth,
   viewHeight,
+  offsetX = 0,
+  offsetY = 0,
 }: FaceBoxProps) {
   const scaleX = viewWidth / imageWidth;
   const scaleY = viewHeight / imageHeight;
 
-  const scaledLeft = bounds.origin.x * scaleX;
-  const scaledTop = bounds.origin.y * scaleY;
+  const scaledLeft = bounds.origin.x * scaleX + offsetX;
+  const scaledTop = bounds.origin.y * scaleY + offsetY;
   const scaledWidth = bounds.size.width * scaleX;
   const scaledHeight = bounds.size.height * scaleY;
 
